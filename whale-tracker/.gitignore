@@ -1,0 +1,39 @@
+# Secrets — never commit real keys
+.env
+.env.local
+*.pem
+
+# Data / database artefacts
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.csv
+data/*.json
+!data/.gitkeep
+exports/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
