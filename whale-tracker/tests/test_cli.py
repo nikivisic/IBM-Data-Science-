@@ -131,8 +131,9 @@ def test_ingest_dry_run_makes_no_calls_and_reports_credits(db, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["dry_run"] is True
-    # 2 tokens x 10 pages x 100 credits, plus the DAS metadata fallback.
-    assert payload["totals"]["helius"]["credits"] == 2 * 10 * 100 + 2 * 10
+    # 2 tokens x 10 pages x 10 credits on the default (cheap) history
+    # endpoint, plus the DAS metadata fallback.
+    assert payload["totals"]["helius"]["credits"] == 2 * 10 * 10 + 2 * 10
     assert payload["totals"]["helius"]["requests"] == 2 * 10 + 2
     assert all(check["fits"] for check in payload["budget_check"])
     # No API key is configured in the test environment: a real run would have
@@ -141,7 +142,8 @@ def test_ingest_dry_run_makes_no_calls_and_reports_credits(db, capsys):
 
 def test_ingest_dry_run_exits_nonzero_when_over_budget(db, capsys):
     assert run(db + ["ingest", "--token", "M1", "--token", "M2", "--token", "M3",
-                     "--max-txs", "100000", "--dry-run"]) == 1
+                     "--max-txs", "100000", "--history-strategy", "enhanced_tx",
+                     "--dry-run"]) == 1
     out = capsys.readouterr().out
     assert "This run would breach" in out
     assert "credits/run" in out

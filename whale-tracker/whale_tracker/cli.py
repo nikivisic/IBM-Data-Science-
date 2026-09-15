@@ -30,6 +30,7 @@ from .budget import BudgetExceeded, BudgetTracker, month_to_date
 from .clients.base import ApiError
 from .clients.birdeye import BirdeyeClient
 from .clients.helius import HeliusClient
+from .clients.helius_history import planned_strategies
 from .clients.prices import DexScreenerPriceSource, PriceChain, build_price_chain
 from .config import ConfigError, Settings, WSOL_MINT, load_settings
 from .db import connect, init_db, table_counts
@@ -250,6 +251,8 @@ def apply_source_overrides(settings: Settings, args: argparse.Namespace) -> Sett
         )
     if getattr(args, "enable_birdeye", False):
         changes["enable_birdeye"] = True
+    if getattr(args, "history_strategy", None):
+        changes["helius_history_strategy"] = args.history_strategy
     if not changes:
         return settings
     return replace(settings, **changes)
@@ -326,6 +329,8 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
         "helius_key": bool(settings.helius_api_key),
         "birdeye_key": bool(settings.birdeye_api_key),
         "price_sources": list(settings.active_price_sources()),
+        "history_strategy": settings.helius_history_strategy,
+        "history_plan": list(planned_strategies(settings)),
         "budget_enforce": settings.budget_enforce,
         "month": month,
         "usage": usage_rows,
@@ -340,6 +345,11 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
     print(f"keys: helius={'set' if settings.helius_api_key else 'MISSING'} "
           f"birdeye={'set' if settings.birdeye_api_key else 'MISSING'}")
     print(f"price sources: {', '.join(settings.active_price_sources()) or '(none)'}")
+    costs = settings.credit_costs()
+    plan = " -> ".join(
+        f"{name}({costs.history_cost(name)})" for name in planned_strategies(settings)
+    )
+    print(f"history endpoints (credits/page): {plan}")
     print(f"budget caps: {'enforced' if settings.budget_enforce else 'DISABLED'}")
     print_table(
         [{"table": k, "rows": v} for k, v in counts.items()],
@@ -441,6 +451,7 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
         ],
     )
     runtime.report()
+    print_history_endpoint(runtime)
     print_usage(runtime.budget)
     if failures and not results:
         print(f"\nall {failures} token(s) failed — nothing ingested", file=sys.stderr)
@@ -451,6 +462,19 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
         return cmd_analyse(args, settings)
     print("\nnext: whale-tracker expand   (pull each candidate's wider history)")
     return 0
+
+
+def print_history_endpoint(runtime: "Runtime") -> None:
+    """Say which history endpoint actually served the run, and what it cost."""
+    if runtime.helius is None:
+        return
+    history = runtime.helius.history
+    if history.resolved is None:
+        return
+    credits = runtime.helius.settings.credit_costs().history_cost(history.resolved)
+    print(f"\nhistory endpoint: {history.resolved} ({credits:,} credits/page)")
+    for name, reason in history.unavailable.items():
+        print(f"  skipped {name}: {reason}")
 
 
 def print_usage(tracker: BudgetTracker) -> None:
@@ -552,6 +576,7 @@ def cmd_expand(args: argparse.Namespace, settings: Settings) -> int:
             print(f"! {wallet}: {exc}", file=sys.stderr)
     print(f"\n{total_new} new trades across {done} wallets")
     runtime.report()
+    print_history_endpoint(runtime)
     print_usage(runtime.budget)
     if args.analyse:
         return cmd_analyse(args, settings)
@@ -1075,6 +1100,14 @@ def add_budget_flags(parser: argparse.ArgumentParser) -> None:
                         help="override the per-run Helius credit cap")
 
 
+def add_history_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--history-strategy",
+        choices=["auto", "parsed_events", "bulk_history", "enhanced_tx"],
+        help="transaction-history endpoint to prefer (default: auto, cheapest first)",
+    )
+
+
 def add_price_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--price-sources",
                         help="comma-separated keyless sources in priority order "
@@ -1115,6 +1148,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--json", action="store_true", help="machine-readable dry-run output")
     add_budget_flags(ingest)
     add_price_flags(ingest)
+    add_history_flags(ingest)
     ingest.set_defaults(func=cmd_ingest)
 
     expand = sub.add_parser(
@@ -1139,6 +1173,7 @@ def build_parser() -> argparse.ArgumentParser:
     expand.add_argument("--json", action="store_true", help="machine-readable dry-run output")
     add_budget_flags(expand)
     add_price_flags(expand)
+    add_history_flags(expand)
     expand.set_defaults(func=cmd_expand)
 
     analyse = sub.add_parser("analyse", help="rebuild P&L, detect patterns and score wallets")

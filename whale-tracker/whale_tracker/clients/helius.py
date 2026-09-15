@@ -1,11 +1,17 @@
-"""Helius client: parsed (enhanced) transaction history.
+"""Helius client: transaction history and RPC.
 
-Helius is the primary discovery source. Asking it for an address's parsed
-transaction history — where the address is the *mint* — yields every swap that
-touched that token, already decoded into balance changes, which is what we need
-to attribute trades to wallets.
+Helius is the primary discovery source. Asking it for an address's transaction
+history — where the address is the *mint* — yields every swap that touched that
+token, which is what we need to attribute trades to wallets.
 
-Docs: https://docs.helius.dev/api-reference/enhanced-transactions-api
+*Which* endpoint serves that history is decided at runtime by
+`helius_history.HeliusHistory`, cheapest first: the Parsed Events API (beta),
+then bulk `getTransactionsForAddress`-style history (~10 credits), and only
+then the Enhanced Transactions API (100 credits), which Helius now recommends
+migrating away from. Whatever answers is adapted into a single shape, so
+`extract_legs` below — and everything downstream of it — is unchanged.
+
+Docs: https://docs.helius.dev/api-reference
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from ..config import QUOTE_MINTS, Settings, WSOL_MINT
 from ..logging_setup import get_logger
 from ..models import SwapLeg
 from .base import ApiError, HttpClient
+from .helius_history import HeliusHistory
 
 log = get_logger(__name__)
 
@@ -44,10 +51,12 @@ class HeliusClient:
             conn=conn,
             cache_ttl_seconds=settings.http_cache_ttl_seconds,
             budget=budget,
-            # Most traffic from this client is the Enhanced Transactions API;
-            # RPC calls override this per call with their own method name.
-            cost_kind="enhanced_tx",
+            # Every call states its own billing family; this is only the
+            # fallback for anything that does not.
+            cost_kind="rpc",
         )
+        #: Chooses and remembers the cheapest history endpoint that works.
+        self.history = HeliusHistory(self, settings)
 
     # -- raw endpoints ----------------------------------------------------
     def address_transactions(
@@ -87,32 +96,22 @@ class HeliusClient:
 
         Stops at `max_txs`, or as soon as a page falls entirely before
         `since_ts` (history is returned newest-first, so that is the end).
+
+        The endpoint behind this is chosen by cost and availability; callers see
+        the same transaction shape either way.
         """
-        seen = 0
-        before: Optional[str] = None
-        while seen < max_txs:
-            page = self.address_transactions(
-                address, before=before, limit=min(100, max_txs - seen), tx_type=tx_type
-            )
-            if not page:
-                return
-            for tx in page:
-                ts = int(tx.get("timestamp") or 0)
-                if until_ts is not None and ts > until_ts:
-                    continue
-                if since_ts is not None and ts and ts < since_ts:
-                    log.debug(
-                        "helius.window_exhausted",
-                        extra={"ctx": {"address": address, "ts": ts, "since": since_ts}},
-                    )
-                    return
-                seen += 1
-                yield tx
-                if seen >= max_txs:
-                    return
-            before = page[-1].get("signature")
-            if not before:
-                return
+        yield from self.history.iter_transactions(
+            address,
+            max_txs=max_txs,
+            tx_type=tx_type,
+            since_ts=since_ts,
+            until_ts=until_ts,
+        )
+
+    @property
+    def history_strategy(self) -> Optional[str]:
+        """Which history endpoint this client settled on, once it has run."""
+        return self.history.resolved
 
     def transactions_by_signature(self, signatures: Sequence[str]) -> list[dict[str, Any]]:
         """Parse up to 100 signatures at a time."""
@@ -130,14 +129,15 @@ class HeliusClient:
                 out.extend(payload)
         return out
 
-    def rpc(self, method: str, params: Any) -> Any:
+    def rpc(self, method: str, params: Any, *, cost_kind: str = "rpc") -> Any:
         payload = self.http.post(
             f"{self.settings.helius_rpc_url}/",
             params={"api-key": self.api_key},
             json_body={"jsonrpc": "2.0", "id": "whale-tracker", "method": method, "params": params},
             # DAS methods and getProgramAccounts are billed above plain RPC;
-            # the cost table resolves that from the method name.
-            cost_kind="rpc",
+            # the cost table resolves that from the method name unless the
+            # caller names a billing family explicitly.
+            cost_kind=cost_kind,
             cost_method=method,
         )
         if isinstance(payload, dict) and payload.get("error"):

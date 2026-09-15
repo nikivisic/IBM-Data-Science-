@@ -194,17 +194,68 @@ Helius bills per method, so the estimate does too:
 | Call | Credits | Set by |
 |---|---|---|
 | Ordinary RPC | 1 | `HELIUS_CREDITS_RPC` |
+| `getSignaturesForAddress` | 1 | `HELIUS_CREDITS_SIGNATURES` |
 | `getProgramAccounts` | 10 | `HELIUS_CREDITS_HEAVY_RPC` |
 | DAS methods (`getAsset`, `searchAssets`, …) | 10 | `HELIUS_CREDITS_DAS` |
+| Parsed Events API (beta) | 10 | `HELIUS_CREDITS_PARSED_EVENTS` |
+| Bulk address history | 10 | `HELIUS_CREDITS_BULK_HISTORY` |
 | Enhanced Transactions API | 100 | `HELIUS_CREDITS_ENHANCED_TX` |
 
-The Enhanced Transactions API is what ingestion actually uses, so it dominates
-every estimate — **check the current rate for your plan and set
-`HELIUS_CREDITS_ENHANCED_TX` accordingly** before trusting a projection. The
-keyless price sources cost no credits; they are capped by request count only.
+**Confirm these against your own plan.** Nothing here can read Helius's price
+list, so every rate is configuration; the history rate in particular dominates
+every projection.
 
 Token metadata is deliberately routed to the cheapest source that can answer:
 DexScreener (free) first, Helius DAS (10 credits) only as a fallback.
+
+### Which endpoint serves transaction history
+
+History is the bulk of the spend, and the Enhanced Transactions API costs 100
+credits a page — Helius now recommends migrating off it. The client therefore
+picks an endpoint **cheapest first**, and only falls back when one is genuinely
+unavailable:
+
+| Order | Endpoint | Credits/page | Notes |
+|---|---|---|---|
+| 1 | Parsed Events API | 10 | Open beta; not on every account |
+| 2 | Bulk address history (`getTransactionsForAddress`-style) | 10 | Paginated transaction fetch over the same signature range |
+| 3 | Enhanced Transactions API | 100 | Last resort, so a plan with only this still works |
+
+For a 5,000-transaction token that is **500 credits instead of 5,000**:
+
+```bash
+whale-tracker ingest --token <mint> --dry-run                            # 510 credits
+whale-tracker ingest --token <mint> --history-strategy enhanced_tx --dry-run   # 5,010
+```
+
+The choice is a **runtime probe, not an assumption**. The first page either
+comes back or says the endpoint is missing or not enabled (404, `-32601`
+unknown method, a feature-gated 403), and the chain moves down, logging which
+endpoint it settled on and why it skipped the others. Three things deliberately
+do *not* trigger a fallback:
+
+* **429 and 5xx** — those mean "try again", and the HTTP layer already retries
+  them. Falling back would pay for the same page twice on a dearer endpoint.
+* **A failure after the first successful page** — once a walk has started, the
+  endpoint is locked in; re-walking elsewhere would re-pay for pages already
+  fetched. That case raises instead.
+* **A response in a shape the adapter cannot read** — treated as unavailable so
+  the run moves on, rather than silently ingesting nothing.
+
+Pin one endpoint with `--history-strategy` or `HELIUS_HISTORY_STRATEGY`. An
+explicit choice still falls back if that endpoint is not enabled — aborting a
+paid run because a beta endpoint went away helps nobody.
+
+Endpoint paths and RPC method names are configuration
+(`HELIUS_PARSED_EVENTS_PATH`, `HELIUS_BULK_HISTORY_METHOD`), so a rename or a
+different rollout does not need a code change. Whatever answers is adapted into
+one shape before it reaches the parser, so ingestion, scoring and the backtest
+neither know nor care which endpoint was used.
+
+A note on what is *not* cheaper: fetching a signature list and then calling
+`getTransaction` once per signature costs ~1 credit per transaction, which is
+the same ~100 credits per 100-transaction page as the Enhanced endpoint. The
+saving comes from a *bulk* fetch, which is what the second strategy uses.
 
 ### Caps
 
@@ -478,6 +529,7 @@ Budget and price flags, available on `ingest`, `expand` and `price-check`:
 | `--dry-run` | Project cost, call nothing (`ingest`, `expand` only) |
 | `--max-requests N` | Per-run request cap for every provider, this run only |
 | `--max-credits N` | Per-run Helius credit cap, this run only |
+| `--history-strategy S` | Pin the history endpoint (`auto`, `parsed_events`, `bulk_history`, `enhanced_tx`) |
 | `--price-sources a,b` | Override the keyless chain and its order |
 | `--enable-birdeye` | Append Birdeye to the chain (needs a key) |
 | `--max-wallets-per-token N` | Fan-out cap per seed token (`expand`) |
@@ -529,7 +581,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-160 tests, no network access required. They cover the P&L arithmetic
+197 tests, no network access required. They cover the P&L arithmetic
 (average-cost basis, partial exits, airdrops, dust), the scoring transforms and
 their edge cases, all three detectors, the backtest fill model, provider
 response parsing (including aggregator routes and balance-change fallbacks),
@@ -544,7 +596,11 @@ The budget and price layers are covered specifically:
 * price fallback order, per-source 429 cooldown and its expiry, spot-only
   sources being skipped for old timestamps, cache hits served from
   `price_points`, and a parametrised check that a 429 from *each* real source
-  is handled the same way.
+  is handled the same way;
+* history endpoint selection: the same swap in all three payload shapes
+  producing identical legs through the **unchanged** parser, fallback on 404 /
+  unknown method / unreadable shape, no fallback on 429 or 5xx, cursor
+  pagination past skipped records, and each endpoint billed at its own rate.
 
 ---
 
@@ -561,7 +617,8 @@ whale_tracker/
 ├── estimate.py         # --dry-run projections and budget checks
 ├── clients/
 │   ├── base.py         # rate limiting, retries, response cache, budget metering
-│   ├── helius.py       # parsed transaction history + swap-leg extraction
+│   ├── helius.py       # Helius client + swap-leg extraction (the parser)
+│   ├── helius_history.py  # cheapest-first history endpoints and their adapters
 │   ├── prices.py       # Jupiter / DexScreener / GeckoTerminal fallback chain
 │   └── birdeye.py      # trade tape, token metadata, historical prices (optional)
 ├── ingest.py           # discovery, USD pricing of the quote leg, persistence
@@ -597,6 +654,14 @@ Worth knowing before you trust the output:
   cannot read your Helius plan, so `--dry-run` is only as accurate as
   `HELIUS_CREDITS_*`. Verify the Enhanced Transactions rate against your
   dashboard once; it dominates every projection.
+* **The Parsed Events shape is inferred, not verified.** That endpoint could
+  not be reached from the machine this was built on, so its adapter is written
+  to be shape-tolerant and treats anything it cannot read as "endpoint
+  unavailable" — the run falls back rather than quietly ingesting nothing. The
+  first live run will say in the log which endpoint it settled on; if it skips
+  Parsed Events with "could not adapt", send me the payload and the adapter is
+  a small fix. The bulk and raw-RPC adapters are built on the documented,
+  stable JSON-RPC transaction shape and are tested against it.
 * **Free price endpoints change without notice.** The parsers tolerate the
   response shapes each API is documented to return, and fall through to the
   next source when one does not answer. `whale-tracker price-check` is the

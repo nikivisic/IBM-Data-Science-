@@ -52,6 +52,12 @@ DAS_METHODS = frozenset(
 #: Other methods Helius bills above the standard rate.
 HEAVY_RPC_METHODS = frozenset({"getprogramaccounts"})
 
+#: Bulk address-history methods, billed as heavy RPC rather than parsed.
+BULK_HISTORY_METHODS = frozenset({"gettransactionsforaddress", "gettransactions"})
+
+#: The paginated signature list. Ordinary RPC.
+SIGNATURE_METHODS = frozenset({"getsignaturesforaddress"})
+
 
 class BudgetExceeded(RuntimeError):
     """A provider cap would be breached by the call that was about to be made."""
@@ -85,26 +91,52 @@ class CreditCosts:
     heavy_rpc: int = 10
     das: int = 10
     enhanced_tx: int = 100
+    #: Parsed Events API (open beta) — the cheapest history path when enabled.
+    parsed_events: int = 10
+    #: `getTransactionsForAddress`-style bulk history.
+    bulk_history: int = 10
+    #: `getSignaturesForAddress`.
+    signatures: int = 1
+    #: Single `getTransaction`.
+    transaction: int = 1
     default: int = 1
 
     def for_call(self, *, kind: str = "rpc", method: str = "") -> int:
-        """Credits for one call. `kind` is the endpoint family, `method` the RPC method."""
-        if kind == "enhanced_tx":
-            return self.enhanced_tx
+        """Credits for one call. `kind` is the endpoint family, `method` the RPC method.
+
+        `kind` wins when it names a specific family, because the same RPC
+        method can be billed differently depending on the endpoint serving it;
+        otherwise the method name decides.
+        """
+        explicit = {
+            "enhanced_tx": self.enhanced_tx,
+            "parsed_events": self.parsed_events,
+            "bulk_history": self.bulk_history,
+            "signatures": self.signatures,
+            "transaction": self.transaction,
+            "das": self.das,
+            "heavy_rpc": self.heavy_rpc,
+        }
+        if kind in explicit:
+            return explicit[kind]
         if kind in ("free", "none"):
             return 0
         name = (method or "").lower()
         if name in DAS_METHODS:
             return self.das
+        if name in BULK_HISTORY_METHODS:
+            return self.bulk_history
+        if name in SIGNATURE_METHODS:
+            return self.signatures
         if name in HEAVY_RPC_METHODS:
-            return self.heavy_rpc
-        if kind == "das":
-            return self.das
-        if kind == "heavy_rpc":
             return self.heavy_rpc
         if kind == "rpc":
             return self.rpc
         return self.default
+
+    def history_cost(self, strategy: str) -> int:
+        """Credits per page for a named history strategy."""
+        return self.for_call(kind=strategy)
 
 
 @dataclass

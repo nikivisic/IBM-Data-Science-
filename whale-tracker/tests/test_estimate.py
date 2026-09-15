@@ -29,22 +29,63 @@ def by_provider(estimate):
     return estimate.totals()
 
 
+def history_item(estimate):
+    return next(i for i in estimate.items if "history pages" in i.label)
+
+
 def test_ingest_projection_is_pages_times_cost(settings):
+    """The default projection uses the cheapest history endpoint, not Enhanced."""
     estimate = estimate_ingest(settings, ["m1", "m2"], max_txs=1_000, now_ts=NOW)
     pages_per_token = 1_000 // HELIUS_PAGE_SIZE
-    tape = next(i for i in estimate.items if i.label == "parsed transaction pages")
+    tape = history_item(estimate)
 
     assert tape.calls == 2 * pages_per_token
-    assert tape.credits_each == settings.helius_credits_enhanced_tx
-    assert tape.credits == 2 * pages_per_token * 100
+    assert tape.credits_each == settings.helius_credits_parsed_events
+    assert tape.credits == 2 * pages_per_token * 10
+
+
+def test_default_projection_is_ten_times_cheaper_than_enhanced(settings):
+    """The whole point of the migration, asserted as a number."""
+    cheap = estimate_ingest(settings, ["m1"], max_txs=5_000, now_ts=NOW)
+    enhanced = estimate_ingest(
+        settings, ["m1"], max_txs=5_000, strategy="enhanced_tx", now_ts=NOW
+    )
+    assert history_item(enhanced).credits == 10 * history_item(cheap).credits
+    assert enhanced.totals()["helius"]["requests"] == cheap.totals()["helius"]["requests"]
+
+
+def test_projection_follows_an_explicit_strategy(settings):
+    for strategy, expected in (
+        ("parsed_events", 10),
+        ("bulk_history", 10),
+        ("enhanced_tx", 100),
+    ):
+        estimate = estimate_ingest(settings, ["m1"], max_txs=100, strategy=strategy, now_ts=NOW)
+        assert history_item(estimate).credits_each == expected
+        assert dict(estimate.facts)["history endpoint"].startswith(strategy)
+
+
+def test_projection_warns_about_the_fallback_cost(settings):
+    estimate = estimate_ingest(settings, ["m1"], max_txs=1_000, now_ts=NOW)
+    note = " ".join(estimate.notes)
+    assert "falls back" in note
+    assert "worst case" in note
+    # 10 pages x 100 credits if only the Enhanced endpoint is available.
+    assert "1,000 credits" in note
+
+
+def test_no_fallback_note_when_already_on_the_dearest_endpoint(settings):
+    estimate = estimate_ingest(settings, ["m1"], strategy="enhanced_tx", now_ts=NOW)
+    assert not any("worst case" in note for note in estimate.notes)
 
 
 def test_ingest_projection_respects_the_configured_cost_table(monkeypatch, tmp_path):
+    """Costs are configuration, not constants: a plan with different rates re-prices."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HELIUS_CREDITS_ENHANCED_TX", "1")
     settings = load_settings(override=True)
-    estimate = estimate_ingest(settings, ["m1"], max_txs=500, now_ts=NOW)
-    tape = next(i for i in estimate.items if i.label == "parsed transaction pages")
+    estimate = estimate_ingest(settings, ["m1"], max_txs=500, strategy="enhanced_tx", now_ts=NOW)
+    tape = history_item(estimate)
     assert tape.credits_each == 1
     assert tape.credits == 5
 
@@ -86,8 +127,13 @@ def test_expand_projection(settings):
     item = estimate.items[0]
     assert item.provider == "helius"
     assert item.calls == 40 * 2          # 200 txs = 2 pages of 100
-    assert item.credits == 40 * 2 * 100
+    assert item.credits == 40 * 2 * 10   # cheap history endpoint
     assert by_provider(estimate)["helius"]["requests"] == 80
+
+    dear = estimate_expand(
+        settings, wallet_count=40, max_txs_per_wallet=200, strategy="enhanced_tx", now_ts=NOW
+    )
+    assert dear.items[0].credits == 40 * 2 * 100
 
 
 def test_expand_defaults_to_the_low_fan_out_caps(settings):
@@ -123,9 +169,12 @@ def test_budget_check_counts_what_was_already_spent_today(settings, conn):
     )
     conn.commit()
     tracker = BudgetTracker(conn, settings.provider_budgets(), costs=settings.credit_costs())
-    # 3 tokens x 50 pages x 100 credits = 15,000, which no longer fits in the
-    # 1,000,000 monthly free tier once 990,000 is already spent.
-    estimate = estimate_ingest(settings, ["m1", "m2", "m3"], max_txs=5_000, now_ts=NOW)
+    # 3 tokens x 50 pages x 100 credits = 15,000 on the Enhanced endpoint,
+    # which no longer fits in the 1,000,000 monthly free tier once 990,000 is
+    # already spent.
+    estimate = estimate_ingest(
+        settings, ["m1", "m2", "m3"], max_txs=5_000, strategy="enhanced_tx", now_ts=NOW
+    )
     checks = budget_check(estimate, tracker, settings, conn)
 
     monthly = next(c for c in checks if c["limit_name"] == "credits/month")
@@ -133,11 +182,21 @@ def test_budget_check_counts_what_was_already_spent_today(settings, conn):
     assert monthly["projected"] == 15_030
     assert monthly["fits"] is False
 
+    # The same run on the default endpoint fits comfortably.
+    cheap = estimate_ingest(settings, ["m1", "m2", "m3"], max_txs=5_000, now_ts=NOW)
+    cheap_monthly = next(
+        c for c in budget_check(cheap, tracker, settings, conn)
+        if c["limit_name"] == "credits/month"
+    )
+    assert cheap_monthly["fits"] is True
+
 
 def test_render_reports_the_numbers_and_the_verdict(settings, conn):
     budgets = {"helius": ProviderBudget("helius", max_credits_per_run=1_000)}
     tracker = BudgetTracker(conn, budgets, costs=settings.credit_costs())
-    estimate = estimate_ingest(settings, ["m1", "m2"], max_txs=5_000, now_ts=NOW)
+    estimate = estimate_ingest(
+        settings, ["m1", "m2"], max_txs=5_000, strategy="enhanced_tx", now_ts=NOW
+    )
     text = "\n".join(render(estimate, budget_check(estimate, tracker, settings, conn)))
 
     assert "dry run — no API calls were made" in text
@@ -146,6 +205,14 @@ def test_render_reports_the_numbers_and_the_verdict(settings, conn):
     assert "This run would breach" in text
     assert "Enhanced Transactions API" in text
     assert "upper bound" in text.lower()
+
+
+def test_render_names_the_history_endpoint(settings, conn):
+    tracker = BudgetTracker(conn, settings.provider_budgets(), costs=settings.credit_costs())
+    estimate = estimate_ingest(settings, ["m1"], max_txs=1_000, now_ts=NOW)
+    text = "\n".join(render(estimate, budget_check(estimate, tracker, settings, conn)))
+    assert "history endpoint" in text
+    assert "Parsed Events API (beta)" in text
 
 
 def test_estimate_serialises_for_json_output(settings):

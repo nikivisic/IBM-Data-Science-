@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 from .budget import BudgetTracker, month_to_date
+from .clients.helius_history import STRATEGY_ENHANCED_TX, planned_strategies
 from .config import Settings
 
 #: Helius returns at most 100 parsed transactions per page.
@@ -57,6 +58,8 @@ class Estimate:
     items: list[LineItem] = field(default_factory=list)
     facts: list[tuple[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Transaction cap this projection was built from, used for page maths.
+    _cap: int = 0
 
     def add(self, item: LineItem) -> None:
         if item.calls > 0:
@@ -85,6 +88,65 @@ def _pages(total: int, page_size: int) -> int:
     return max(1, math.ceil(max(total, 1) / page_size))
 
 
+def _history_plan(settings: Settings, strategy: Optional[str] = None) -> tuple[str, tuple[str, ...]]:
+    """(strategy this run would use first, the rest of the fallback chain)."""
+    plan = planned_strategies(settings)
+    if strategy:
+        plan = (strategy, *(name for name in plan if name != strategy))
+    return plan[0], plan[1:]
+
+
+def _history_lines(
+    estimate: "Estimate",
+    settings: Settings,
+    *,
+    label: str,
+    units: int,
+    strategy: Optional[str] = None,
+) -> int:
+    """Add the history line item and the fallback note. Returns pages per unit.
+
+    `units` is tokens (for ingest) or wallets (for expand). The projection uses
+    the *preferred* strategy, and a note carries the worst case, because which
+    endpoint answers is only known once the run makes its first call.
+    """
+    costs = settings.credit_costs()
+    primary, fallbacks = _history_plan(settings, strategy)
+    page_size = settings.helius_history_page_size
+    pages = _pages(_history_cap(estimate), page_size)
+
+    estimate.add(
+        LineItem(
+            label,
+            "helius",
+            units * pages,
+            costs.history_cost(primary),
+            HISTORY_LABELS.get(primary, primary),
+        )
+    )
+    if fallbacks:
+        worst = max(costs.history_cost(name) for name in fallbacks)
+        if worst > costs.history_cost(primary):
+            worst_total = units * pages * worst
+            estimate.notes.append(
+                f"If {primary} is not enabled on this plan the run falls back to "
+                f"{'/'.join(fallbacks)} — worst case {worst_total:,} credits "
+                f"({worst:,} per page via {STRATEGY_ENHANCED_TX})."
+            )
+    return pages
+
+
+HISTORY_LABELS = {
+    "parsed_events": "Parsed Events API (beta)",
+    "bulk_history": "bulk address history (RPC)",
+    "enhanced_tx": "Enhanced Transactions API",
+}
+
+
+def _history_cap(estimate: "Estimate") -> int:
+    return int(getattr(estimate, "_cap", HELIUS_PAGE_SIZE))
+
+
 def _price_history_calls(settings: Settings, since_ts: Optional[int], now_ts: int) -> int:
     """OHLCV calls needed to cover the SOL price span, plus one pool lookup."""
     span_seconds = (now_ts - since_ts) if since_ts else DEFAULT_PRICE_SPAN_DAYS * 86_400
@@ -99,31 +161,31 @@ def estimate_ingest(
     max_txs: Optional[int] = None,
     provider: str = "helius",
     since_ts: Optional[int] = None,
+    strategy: Optional[str] = None,
     now_ts: int,
 ) -> Estimate:
     """Project the cost of `ingest` for the given mints."""
     cap = max_txs if max_txs is not None else settings.max_txs_per_token
-    pages = _pages(cap, HELIUS_PAGE_SIZE)
+    page_size = settings.helius_history_page_size
+    pages = _pages(cap, page_size)
     costs = settings.credit_costs()
     estimate = Estimate(command="ingest")
+    estimate._cap = cap
+    primary, _ = _history_plan(settings, strategy)
 
     estimate.facts = [
         ("tokens", f"{len(mints)}"),
         ("transactions per token (cap)", f"{cap:,}"),
-        ("pages per token", f"{pages:,} × {HELIUS_PAGE_SIZE} per page"),
+        ("pages per token", f"{pages:,} × {page_size} per page"),
+        ("history endpoint", f"{primary} ({costs.history_cost(primary):,} credits/page)"),
         ("provider", provider),
         ("price sources", ", ".join(settings.active_price_sources()) or "(none)"),
     ]
 
     if provider in ("helius", "both"):
-        estimate.add(
-            LineItem(
-                "parsed transaction pages",
-                "helius",
-                len(mints) * pages,
-                costs.enhanced_tx,
-                "Enhanced Transactions API",
-            )
+        _history_lines(
+            estimate, settings, label="transaction history pages",
+            units=len(mints), strategy=strategy,
         )
     if provider in ("birdeye", "both"):
         # Birdeye's tape pages 50 items at a time.
@@ -179,6 +241,7 @@ def estimate_expand(
     wallet_count: int,
     max_txs_per_wallet: Optional[int] = None,
     per_token_limit: Optional[int] = None,
+    strategy: Optional[str] = None,
     now_ts: int,
 ) -> Estimate:
     """Project the cost of `expand` for a known number of candidate wallets."""
@@ -187,24 +250,23 @@ def estimate_expand(
         if max_txs_per_wallet is not None
         else settings.max_txs_per_wallet
     )
-    pages = _pages(cap, HELIUS_PAGE_SIZE)
+    page_size = settings.helius_history_page_size
+    pages = _pages(cap, page_size)
     costs = settings.credit_costs()
     estimate = Estimate(command="expand")
+    estimate._cap = cap
+    primary, _ = _history_plan(settings, strategy)
 
     estimate.facts = [
         ("candidate wallets", f"{wallet_count:,}"),
         ("wallets per seed token (cap)", f"{per_token_limit or settings.max_wallets_per_token:,}"),
         ("transactions per wallet (cap)", f"{cap:,}"),
-        ("pages per wallet", f"{pages:,} × {HELIUS_PAGE_SIZE} per page"),
+        ("pages per wallet", f"{pages:,} × {page_size} per page"),
+        ("history endpoint", f"{primary} ({costs.history_cost(primary):,} credits/page)"),
     ]
-    estimate.add(
-        LineItem(
-            "wallet history pages",
-            "helius",
-            wallet_count * pages,
-            costs.enhanced_tx,
-            "Enhanced Transactions API",
-        )
+    _history_lines(
+        estimate, settings, label="wallet history pages",
+        units=wallet_count, strategy=strategy,
     )
     estimate.notes.append(
         "Upper bound: a wallet with a shorter history than the cap stops early."

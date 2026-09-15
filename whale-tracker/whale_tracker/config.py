@@ -128,6 +128,21 @@ class Settings:
     helius_credits_heavy_rpc: int = 10
     helius_credits_das: int = 10
     helius_credits_enhanced_tx: int = 100
+    helius_credits_parsed_events: int = 10
+    helius_credits_bulk_history: int = 10
+    helius_credits_signatures: int = 1
+    helius_credits_transaction: int = 1
+
+    # --- transaction-history endpoint selection ---------------------------
+    #: auto | parsed_events | bulk_history | enhanced_tx
+    helius_history_strategy: str = "auto"
+    helius_parsed_events_path: str = "/v1/parsed-events"
+    helius_bulk_history_method: str = "getTransactionsForAddress"
+    #: Option key used to filter the bulk method by transaction type. Empty
+    #: means "do not send a filter" — an unknown option is rejected by some
+    #: RPC implementations, so this is opt-in.
+    helius_bulk_history_filter: str = ""
+    helius_history_page_size: int = 100
 
     # --- price layer -------------------------------------------------------
     price_sources: tuple[str, ...] = DEFAULT_PRICE_SOURCES
@@ -148,6 +163,10 @@ class Settings:
             heavy_rpc=self.helius_credits_heavy_rpc,
             das=self.helius_credits_das,
             enhanced_tx=self.helius_credits_enhanced_tx,
+            parsed_events=self.helius_credits_parsed_events,
+            bulk_history=self.helius_credits_bulk_history,
+            signatures=self.helius_credits_signatures,
+            transaction=self.helius_credits_transaction,
         )
 
     def provider_budgets(self) -> dict[str, ProviderBudget]:
@@ -262,6 +281,17 @@ def load_settings(env_file: Optional[str | Path] = None, *, override: bool = Fal
         helius_credits_heavy_rpc=_env_int("HELIUS_CREDITS_HEAVY_RPC", 10),
         helius_credits_das=_env_int("HELIUS_CREDITS_DAS", 10),
         helius_credits_enhanced_tx=_env_int("HELIUS_CREDITS_ENHANCED_TX", 100),
+        helius_credits_parsed_events=_env_int("HELIUS_CREDITS_PARSED_EVENTS", 10),
+        helius_credits_bulk_history=_env_int("HELIUS_CREDITS_BULK_HISTORY", 10),
+        helius_credits_signatures=_env_int("HELIUS_CREDITS_SIGNATURES", 1),
+        helius_credits_transaction=_env_int("HELIUS_CREDITS_TRANSACTION", 1),
+        helius_history_strategy=_env_str("HELIUS_HISTORY_STRATEGY", "auto").lower(),
+        helius_parsed_events_path=_env_str("HELIUS_PARSED_EVENTS_PATH", "/v1/parsed-events"),
+        helius_bulk_history_method=_env_str(
+            "HELIUS_BULK_HISTORY_METHOD", "getTransactionsForAddress"
+        ),
+        helius_bulk_history_filter=_env_str("HELIUS_BULK_HISTORY_FILTER", ""),
+        helius_history_page_size=_env_int("HELIUS_HISTORY_PAGE_SIZE", 100),
         price_sources=_env_list("PRICE_SOURCES", DEFAULT_PRICE_SOURCES),
         enable_birdeye=_env_bool("ENABLE_BIRDEYE", False),
         price_cache_ttl_seconds=_env_int("PRICE_CACHE_TTL_SECONDS", 86_400),

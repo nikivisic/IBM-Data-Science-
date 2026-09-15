@@ -262,6 +262,9 @@ def test_ingest_stops_cleanly_at_the_cap_and_keeps_what_it_pulled(conn, tmp_path
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HELIUS_API_KEY", "test-key")
     monkeypatch.setenv("MIN_TRADE_USD", "0")
+    # Pinned to the 100-credit endpoint so the arithmetic below is about the
+    # cap, not about which endpoint served the pages.
+    monkeypatch.setenv("HELIUS_HISTORY_STRATEGY", "enhanced_tx")
     settings = load_settings(override=True)
 
     mint = "MemeMint1111111111111111111111111111111111"
