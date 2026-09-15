@@ -18,7 +18,7 @@ from .logging_setup import get_logger
 
 log = get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -159,6 +159,27 @@ CREATE TABLE IF NOT EXISTS price_points (
     ts_bucket  INTEGER NOT NULL,
     price_usd  REAL NOT NULL,
     PRIMARY KEY (mint, ts_bucket)
+);
+
+-- Per-provider, per-UTC-day API consumption. Survives restarts, so caps and
+-- month-to-date reporting are not reset by a crash.
+CREATE TABLE IF NOT EXISTS api_usage (
+    provider    TEXT NOT NULL,
+    day         TEXT NOT NULL,
+    requests    INTEGER DEFAULT 0,
+    credits     INTEGER DEFAULT 0,
+    cache_hits  INTEGER DEFAULT 0,
+    PRIMARY KEY (provider, day)
+);
+CREATE INDEX IF NOT EXISTS ix_api_usage_day ON api_usage (day);
+
+-- Liquidity pool discovered for a mint, so pool lookups are not repeated.
+CREATE TABLE IF NOT EXISTS token_pools (
+    mint       TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    pool       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (mint, source)
 );
 
 -- Raw HTTP response cache so re-runs don't re-spend API credits.
@@ -343,6 +364,22 @@ def upsert_price_points(conn: sqlite3.Connection, rows: Sequence[Mapping[str, An
     return _upsert(conn, "price_points", rows, ["mint", "ts_bucket"])
 
 
+def get_token_pool(conn: sqlite3.Connection, mint: str, source: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT pool FROM token_pools WHERE mint = ? AND source = ?", (mint, source)
+    ).fetchone()
+    return row["pool"] if row is not None else None
+
+
+def put_token_pool(conn: sqlite3.Connection, mint: str, source: str, pool: str) -> None:
+    conn.execute(
+        "INSERT INTO token_pools(mint, source, pool, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(mint, source) DO UPDATE SET pool=excluded.pool, updated_at=excluded.updated_at",
+        (mint, source, pool, int(time.time())),
+    )
+    conn.commit()
+
+
 def cache_get(conn: sqlite3.Connection, key: str, ttl_seconds: int) -> Optional[Any]:
     if ttl_seconds <= 0:
         return None
@@ -407,6 +444,7 @@ def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
         "wallet_flags",
         "backtest_runs",
         "backtest_trades",
+        "price_points",
     ]
     out: dict[str, int] = {}
     for name in names:

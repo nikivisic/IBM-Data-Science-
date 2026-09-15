@@ -118,3 +118,106 @@ def test_backtest_without_wallets_is_rejected(db):
     run(db + ["init-db"])
     with pytest.raises(SystemExit):
         run(db + ["backtest"])
+
+
+# ---------------------------------------------------------------------------
+# budget controls and the free price layer
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_dry_run_makes_no_calls_and_reports_credits(db, capsys):
+    assert run(db + ["ingest", "--token", "MintA", "--token", "MintB", "--max-txs", "1000",
+                     "--dry-run", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["dry_run"] is True
+    # 2 tokens x 10 pages x 100 credits, plus the DAS metadata fallback.
+    assert payload["totals"]["helius"]["credits"] == 2 * 10 * 100 + 2 * 10
+    assert payload["totals"]["helius"]["requests"] == 2 * 10 + 2
+    assert all(check["fits"] for check in payload["budget_check"])
+    # No API key is configured in the test environment: a real run would have
+    # failed, so reaching here proves nothing was called.
+
+
+def test_ingest_dry_run_exits_nonzero_when_over_budget(db, capsys):
+    assert run(db + ["ingest", "--token", "M1", "--token", "M2", "--token", "M3",
+                     "--max-txs", "100000", "--dry-run"]) == 1
+    out = capsys.readouterr().out
+    assert "This run would breach" in out
+    assert "credits/run" in out
+
+
+def test_dry_run_respects_a_cap_override(db, capsys):
+    assert run(db + ["ingest", "--token", "M1", "--max-txs", "1000",
+                     "--max-credits", "100", "--dry-run"]) == 1
+    assert "OVER" in capsys.readouterr().out
+
+
+def test_expand_dry_run_counts_real_candidates(db, capsys):
+    assert run(db + ["demo-seed", "--tokens", "4", "--seed", "8", "--days", "20"]) == 0
+    capsys.readouterr()
+
+    assert run(db + ["expand", "--dry-run", "--min-tokens", "2", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    wallets = int(payload["facts"]["candidate wallets"])
+    assert wallets > 0
+    assert payload["facts"]["transactions per wallet (cap)"] == "200"
+    assert payload["totals"]["helius"]["requests"] == wallets * 2
+
+
+def test_expand_fan_out_cap_shrinks_the_projection(db, capsys):
+    run(db + ["demo-seed", "--tokens", "4", "--seed", "8", "--days", "20"])
+    capsys.readouterr()
+
+    run(db + ["expand", "--dry-run", "--min-tokens", "2", "--json"])
+    wide = json.loads(capsys.readouterr().out)
+    run(db + ["expand", "--dry-run", "--min-tokens", "2", "--max-wallets-per-token", "2",
+              "--max-txs-per-wallet", "100", "--json"])
+    narrow = json.loads(capsys.readouterr().out)
+
+    assert int(narrow["facts"]["candidate wallets"]) < int(wide["facts"]["candidate wallets"])
+    assert narrow["totals"]["helius"]["credits"] < wide["totals"]["helius"]["credits"]
+
+
+def test_status_reports_month_to_date_usage(db, capsys):
+    from whale_tracker.budget import utc_day
+    from whale_tracker.db import init_db
+
+    run(db + ["init-db"])
+    capsys.readouterr()
+    conn = init_db(db[1])
+    conn.execute(
+        "INSERT INTO api_usage(provider, day, requests, credits, cache_hits) "
+        "VALUES ('helius', ?, 120, 12000, 4)",
+        (utc_day(),),
+    )
+    conn.commit()
+    conn.close()
+
+    assert run(db + ["status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    helius = next(row for row in payload["usage"] if row["provider"] == "helius")
+    assert helius["mtd_credits"] == 12_000
+    assert helius["today_requests"] == 120
+    assert helius["monthly_budget"] == 1_000_000
+    assert helius["monthly_pct"] == pytest.approx(0.012)
+    assert payload["price_sources"] == ["jupiter", "dexscreener", "geckoterminal"]
+    assert payload["budget_enforce"] is True
+
+    assert run(db + ["status"]) == 0
+    text = capsys.readouterr().out
+    assert "month to date" in text
+    assert "1.2%" in text
+
+
+def test_price_sources_flag_overrides_the_configured_chain(db, capsys):
+    assert run(db + ["ingest", "--token", "M1", "--dry-run",
+                     "--price-sources", "geckoterminal", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    providers = {item["provider"] for item in payload["items"]}
+    assert "dexscreener" not in providers
+    assert "geckoterminal" in providers
+    # With DexScreener out of the chain, metadata falls back to billed DAS.
+    metadata = next(i for i in payload["items"] if i["label"] == "token metadata")
+    assert metadata["provider"] == "helius"
+    assert metadata["credits_each"] == 10

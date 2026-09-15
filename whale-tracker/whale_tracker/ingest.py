@@ -19,6 +19,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from .clients.birdeye import BirdeyeClient, normalise_trade, overview_to_token_row
 from .clients.helius import HeliusClient, extract_legs
+from .clients.prices import DexScreenerPriceSource, PriceChain
 from .config import STABLE_MINTS, Settings, WSOL_MINT
 from .db import finish_ingest_run, insert_trades, start_ingest_run, upsert_token
 from .logging_setup import get_logger
@@ -30,26 +31,31 @@ log = get_logger(__name__)
 class PriceOracle:
     """Values the quote leg of a swap in USD.
 
-    Order of preference: stablecoin par -> Birdeye hourly history for SOL ->
-    a price already cached in `price_points` -> a static fallback the operator
-    supplied. Anything else returns None and the trade is priced from the
-    provider's own per-token price hint, or dropped.
+    Order of preference: stablecoin par -> the configured price chain (keyless
+    by default: Jupiter, DexScreener, GeckoTerminal) -> a price already cached
+    in `price_points` -> a static fallback the operator supplied. Anything else
+    returns None and the trade is priced from the provider's own per-token
+    price hint, or dropped.
+
+    `source` is anything exposing `price_at(mint, ts)` — a `PriceChain`, or a
+    `BirdeyeClient` directly — so the rest of the pipeline is indifferent to
+    which upstream actually answered.
     """
 
     def __init__(
         self,
         conn: sqlite3.Connection,
-        birdeye: Optional[BirdeyeClient] = None,
+        source: Optional[PriceChain | BirdeyeClient] = None,
         static_sol_price: Optional[float] = None,
     ):
         self.conn = conn
-        self.birdeye = birdeye
+        self.source = source
         self.static_sol_price = static_sol_price
         self.misses = 0
 
     def sol_price(self, ts: int) -> Optional[float]:
-        if self.birdeye is not None:
-            price = self.birdeye.price_at(WSOL_MINT, ts)
+        if self.source is not None:
+            price = self.source.price_at(WSOL_MINT, ts)
             if price:
                 return price
         row = self.conn.execute(
@@ -173,14 +179,22 @@ def fetch_token_metadata(
     *,
     birdeye: Optional[BirdeyeClient] = None,
     helius: Optional[HeliusClient] = None,
+    free_metadata: Optional[DexScreenerPriceSource] = None,
 ) -> None:
-    """Best-effort symbol/name/decimals for a mint; never fatal."""
+    """Best-effort symbol/name/decimals for a mint; never fatal.
+
+    Ordered by cost, not by quality: a free DexScreener lookup is tried before
+    falling back to Helius DAS, which is billed at the heavy rate.
+    """
     row: dict[str, Any] = {"mint": mint}
     try:
         if birdeye is not None:
             overview = birdeye.token_overview(mint)
             if overview:
                 row = overview_to_token_row(mint, overview)
+        if not row.get("symbol") and free_metadata is not None:
+            row.update(free_metadata.token_metadata(mint))
+            row["mint"] = mint
         if not row.get("symbol") and helius is not None:
             row.update(helius.token_metadata(mint))
             row["mint"] = mint
@@ -198,6 +212,7 @@ def ingest_token(
     helius: Optional[HeliusClient] = None,
     birdeye: Optional[BirdeyeClient] = None,
     oracle: Optional[PriceOracle] = None,
+    free_metadata: Optional[DexScreenerPriceSource] = None,
     max_txs: Optional[int] = None,
     since_ts: Optional[int] = None,
     provider: str = "helius",
@@ -214,7 +229,9 @@ def ingest_token(
     wallets: set[str] = set()
 
     try:
-        fetch_token_metadata(conn, mint, birdeye=birdeye, helius=helius)
+        fetch_token_metadata(
+            conn, mint, birdeye=birdeye, helius=helius, free_metadata=free_metadata
+        )
 
         def flush() -> None:
             nonlocal buffer
@@ -264,6 +281,14 @@ def ingest_token(
         log.info("ingest.token.done", extra={"ctx": result.as_ctx()})
         return result
     except Exception as exc:
+        # Keep whatever was already parsed. A budget stop or a provider outage
+        # halfway through a token should not throw away the pages that did
+        # come back — the next run resumes from a larger base.
+        try:
+            flush()
+            _refresh_token_stats(conn, mint)
+        except Exception:  # pragma: no cover - never mask the original failure
+            log.warning("ingest.partial_flush_failed", extra={"ctx": {"mint": mint}})
         finish_ingest_run(
             conn,
             run_id,
@@ -272,7 +297,16 @@ def ingest_token(
             status="error",
             detail=str(exc)[:300],
         )
-        log.error("ingest.token.failed", extra={"ctx": {"mint": mint, "error": str(exc)}})
+        log.error(
+            "ingest.token.failed",
+            extra={
+                "ctx": {
+                    "mint": mint,
+                    "error": str(exc),
+                    "trades_kept": result.trades_written,
+                }
+            },
+        )
         raise
 
 
@@ -283,11 +317,16 @@ def expand_wallet(
     settings: Settings,
     helius: HeliusClient,
     oracle: Optional[PriceOracle] = None,
-    max_txs: int = 1_000,
+    max_txs: Optional[int] = None,
     since_ts: Optional[int] = None,
 ) -> IngestResult:
-    """Pull a wallet's own swap history, across every token it has touched."""
+    """Pull a wallet's own swap history, across every token it has touched.
+
+    `max_txs` defaults to `MAX_TXS_PER_WALLET`, which is deliberately low: a
+    wallet's tail is long, and the first pages carry most of the signal.
+    """
     oracle = oracle or PriceOracle(conn)
+    max_txs = max_txs if max_txs is not None else settings.max_txs_per_wallet
     result = IngestResult(mint=wallet, provider="helius:wallet")
     run_id = start_ingest_run(conn, wallet, "helius:wallet")
     buffer: list[Trade] = []
@@ -330,6 +369,14 @@ def expand_wallet(
         )
         return result
     except Exception as exc:
+        try:
+            if buffer:
+                written, _ = _persist(conn, buffer, settings.min_trade_usd)
+                result.trades_written += written
+            for mint in mints:
+                _refresh_token_stats(conn, mint)
+        except Exception:  # pragma: no cover - never mask the original failure
+            log.warning("ingest.partial_flush_failed", extra={"ctx": {"wallet": wallet}})
         finish_ingest_run(
             conn,
             run_id,
@@ -337,6 +384,12 @@ def expand_wallet(
             trades_new=result.trades_written,
             status="error",
             detail=str(exc)[:300],
+        )
+        log.error(
+            "ingest.wallet.failed",
+            extra={
+                "ctx": {"wallet": wallet, "error": str(exc), "trades_kept": result.trades_written}
+            },
         )
         raise
 
@@ -348,9 +401,16 @@ def candidate_wallets(
     min_trades: int = 2,
     min_volume_usd: float = 0.0,
     limit: Optional[int] = None,
+    per_token_limit: Optional[int] = None,
 ) -> list[str]:
-    """Wallets worth expanding: seen in enough seed tokens to be more than noise."""
-    sql = """
+    """Wallets worth expanding: seen in enough seed tokens to be more than noise.
+
+    `per_token_limit` caps the fan-out: at most that many wallets are taken
+    from each seed token, ranked by USD volume in that token. Without it, one
+    busy mint with 40,000 traders would decide the whole expansion budget.
+    The result is then ordered by total volume and truncated to `limit`.
+    """
+    base = """
         SELECT wallet,
                COUNT(DISTINCT mint) AS tokens,
                COUNT(*)             AS trades,
@@ -358,9 +418,32 @@ def candidate_wallets(
         FROM trades
         GROUP BY wallet
         HAVING tokens >= ? AND trades >= ? AND volume >= ?
-        ORDER BY volume DESC
     """
     params: list[Any] = [min_tokens, min_trades, min_volume_usd]
+
+    if per_token_limit and per_token_limit > 0:
+        sql = f"""
+            WITH eligible AS ({base}),
+            per_token AS (
+                SELECT t.wallet,
+                       t.mint,
+                       SUM(t.value_usd) AS token_volume,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.mint ORDER BY SUM(t.value_usd) DESC
+                       ) AS rank_in_token
+                FROM trades t
+                JOIN eligible e ON e.wallet = t.wallet
+                GROUP BY t.wallet, t.mint
+            )
+            SELECT e.wallet AS wallet, e.volume AS volume
+            FROM eligible e
+            WHERE e.wallet IN (SELECT wallet FROM per_token WHERE rank_in_token <= ?)
+            ORDER BY e.volume DESC
+        """
+        params.append(int(per_token_limit))
+    else:
+        sql = f"{base} ORDER BY volume DESC"
+
     if limit:
         sql += " LIMIT ?"
         params.append(limit)

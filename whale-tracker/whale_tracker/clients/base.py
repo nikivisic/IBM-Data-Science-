@@ -18,6 +18,7 @@ from typing import Any, Mapping, Optional
 
 import requests
 
+from ..budget import BudgetTracker
 from ..db import cache_get, cache_put
 from ..logging_setup import get_logger
 
@@ -81,6 +82,8 @@ class HttpClient:
         cache_ttl_seconds: int = 0,
         default_headers: Optional[Mapping[str, str]] = None,
         session: Optional[requests.Session] = None,
+        budget: Optional[BudgetTracker] = None,
+        cost_kind: str = "rpc",
     ):
         self.base_url = base_url.rstrip("/")
         self.provider = provider
@@ -89,6 +92,9 @@ class HttpClient:
         self.max_retries = max_retries
         self.conn = conn
         self.cache_ttl_seconds = cache_ttl_seconds
+        self.budget = budget
+        #: Billing family for calls from this client unless overridden per call.
+        self.cost_kind = cost_kind
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "whale-tracker/0.1 (+phase1-research)"})
         if default_headers:
@@ -134,6 +140,9 @@ class HttpClient:
         headers: Optional[Mapping[str, str]] = None,
         use_cache: bool = True,
         redact_params: tuple[str, ...] = ("api-key", "api_key"),
+        cost_kind: Optional[str] = None,
+        cost_method: str = "",
+        cache_ttl_seconds: Optional[int] = None,
     ) -> Any:
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         params = dict(params or {})
@@ -142,10 +151,13 @@ class HttpClient:
         )
         cache_key = self._cache_key(method, url, params, json_body)
 
-        if use_cache and self.conn is not None and self.cache_ttl_seconds > 0:
-            cached = cache_get(self.conn, cache_key, self.cache_ttl_seconds)
+        ttl = self.cache_ttl_seconds if cache_ttl_seconds is None else cache_ttl_seconds
+        if use_cache and self.conn is not None and ttl > 0:
+            cached = cache_get(self.conn, cache_key, ttl)
             if cached is not None:
                 self.cache_hits += 1
+                if self.budget is not None:
+                    self.budget.record_cache_hit(self.provider)
                 log.debug(
                     "http.cache_hit",
                     extra={"ctx": {"provider": self.provider, "path": path}},
@@ -156,8 +168,18 @@ class HttpClient:
             k: ("***" if k in redact_params else v) for k, v in params.items()
         }
         last_error: Optional[str] = None
+        last_status: Optional[int] = None
 
         for attempt in range(1, self.max_retries + 1):
+            # Metered before the call leaves the process: a refusal costs
+            # nothing, and a recorded call really was made. Retries count too —
+            # they reach the provider like any other request.
+            if self.budget is not None:
+                self.budget.consume(
+                    self.provider,
+                    kind=cost_kind or self.cost_kind,
+                    method=cost_method,
+                )
             self.limiter.acquire()
             self.calls += 1
             try:
@@ -188,6 +210,7 @@ class HttpClient:
             if response.status_code in RETRY_STATUS:
                 retry_after = _parse_retry_after(response.headers.get("Retry-After"))
                 last_error = f"HTTP {response.status_code}"
+                last_status = response.status_code
                 log.warning(
                     "http.retryable_status",
                     extra={
@@ -237,14 +260,15 @@ class HttpClient:
                     }
                 },
             )
-            if use_cache and self.conn is not None and self.cache_ttl_seconds > 0:
+            if use_cache and self.conn is not None and ttl > 0:
                 cache_put(self.conn, cache_key, payload)
             return payload
 
         raise ApiError(
             self._scrub(
                 f"{self.provider} failed after {self.max_retries} attempts for {path}: {last_error}"
-            )
+            ),
+            status=last_status,
         )
 
     def get(self, path: str, **kwargs: Any) -> Any:

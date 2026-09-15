@@ -16,6 +16,7 @@ import sqlite3
 import time
 from typing import Any, Iterator, Optional
 
+from ..budget import BudgetTracker
 from ..config import QUOTE_MINTS, STABLE_MINTS, Settings, WSOL_MINT
 from ..db import upsert_price_points
 from ..logging_setup import get_logger
@@ -31,7 +32,12 @@ MAX_PAGE = 50
 
 
 class BirdeyeClient:
-    def __init__(self, settings: Settings, conn: Optional[sqlite3.Connection] = None):
+    def __init__(
+        self,
+        settings: Settings,
+        conn: Optional[sqlite3.Connection] = None,
+        budget: Optional[BudgetTracker] = None,
+    ):
         self.settings = settings
         self.conn = conn
         self.http = HttpClient(
@@ -47,6 +53,10 @@ class BirdeyeClient:
                 "x-chain": "solana",
                 "accept": "application/json",
             },
+            budget=budget,
+            # Birdeye bills in its own compute units, which this tool does not
+            # model; its calls are capped by request count only.
+            cost_kind="free",
         )
         self._price_memo: dict[tuple[str, int], float] = {}
 

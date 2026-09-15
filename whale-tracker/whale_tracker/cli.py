@@ -19,17 +19,21 @@ import json
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 from . import __version__
 from .backtest import BacktestConfig, run_backtest
+from .budget import BudgetExceeded, BudgetTracker, month_to_date
 from .clients.base import ApiError
 from .clients.birdeye import BirdeyeClient
 from .clients.helius import HeliusClient
-from .config import ConfigError, Settings, load_settings
+from .clients.prices import DexScreenerPriceSource, PriceChain, build_price_chain
+from .config import ConfigError, Settings, WSOL_MINT, load_settings
 from .db import connect, init_db, table_counts
+from .estimate import budget_check, estimate_expand, estimate_ingest, render
 from .ingest import PriceOracle, candidate_wallets, expand_wallet, ingest_token
 from .logging_setup import configure_logging, get_logger
 from .patterns import PatternConfig, analyse_patterns
@@ -162,21 +166,93 @@ def write_csv(rows: Sequence[dict[str, Any]], path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_clients(
-    settings: Settings, conn: sqlite3.Connection, provider: str
-) -> tuple[Optional[HeliusClient], Optional[BirdeyeClient]]:
-    helius = birdeye = None
-    if provider in ("helius", "both"):
-        helius = HeliusClient(settings, conn)
+@dataclass
+class Runtime:
+    """Everything a network-touching command needs, wired to one budget."""
+
+    budget: BudgetTracker
+    chain: PriceChain
+    helius: Optional[HeliusClient] = None
+    birdeye: Optional[BirdeyeClient] = None
+    free_metadata: Optional[DexScreenerPriceSource] = None
+
+    def oracle(self, conn: sqlite3.Connection, static_sol_price: Optional[float] = None) -> PriceOracle:
+        return PriceOracle(conn, self.chain, static_sol_price=static_sol_price)
+
+    def report(self) -> None:
+        """Log what the run consumed, per provider and per price source."""
+        self.budget.log_run_summary()
+        for name, stats in self.chain.stats().items():
+            if stats["served"] or stats["failures"]:
+                log.info("price.source_summary", extra={"ctx": {"source": name, **stats}})
+
+
+def make_budget(
+    settings: Settings, conn: sqlite3.Connection, args: argparse.Namespace
+) -> BudgetTracker:
+    """Budget tracker with per-run overrides from the command line applied."""
+    budgets = settings.provider_budgets()
+    override_requests = getattr(args, "max_requests", None)
+    override_credits = getattr(args, "max_credits", None)
+    for budget in budgets.values():
+        if override_requests:
+            budget.max_requests_per_run = int(override_requests)
+        if override_credits and budget.provider == "helius":
+            budget.max_credits_per_run = int(override_credits)
+    return BudgetTracker(
+        conn,
+        budgets,
+        enforce=settings.budget_enforce,
+        costs=settings.credit_costs(),
+    )
+
+
+def build_runtime(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    provider: str = "helius",
+    *,
+    need_helius: bool = True,
+) -> Runtime:
+    """Construct clients, the price chain and the shared budget tracker."""
+    budget = make_budget(settings, conn, args)
+    chain = build_price_chain(settings, conn, budget)
+
+    helius = None
+    if need_helius and provider in ("helius", "both"):
+        helius = HeliusClient(settings, conn, budget)
+
+    birdeye = None
     if provider in ("birdeye", "both"):
-        birdeye = BirdeyeClient(settings, conn)
-    if provider == "helius" and settings.birdeye_api_key:
-        # Still useful: Birdeye prices the SOL leg of every historical trade.
+        birdeye = BirdeyeClient(settings, conn, budget)
+    elif settings.enable_birdeye and settings.birdeye_api_key:
         try:
-            birdeye = BirdeyeClient(settings, conn)
+            birdeye = BirdeyeClient(settings, conn, budget)
         except ConfigError:
             birdeye = None
-    return helius, birdeye
+
+    free_metadata = None
+    if "dexscreener" in settings.active_price_sources():
+        free_metadata = DexScreenerPriceSource(settings, conn, budget)
+
+    return Runtime(
+        budget=budget, chain=chain, helius=helius, birdeye=birdeye, free_metadata=free_metadata
+    )
+
+
+def apply_source_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
+    """Let --price-sources / --enable-birdeye override the .env configuration."""
+    changes: dict[str, Any] = {}
+    if getattr(args, "price_sources", None):
+        changes["price_sources"] = tuple(
+            part.strip().lower() for part in args.price_sources.split(",") if part.strip()
+        )
+    if getattr(args, "enable_birdeye", False):
+        changes["enable_birdeye"] = True
+    if not changes:
+        return settings
+    return replace(settings, **changes)
 
 
 def read_token_list(args: argparse.Namespace) -> list[str]:
@@ -217,24 +293,72 @@ def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
     conn = init_db(settings.db_path)
     counts = table_counts(conn)
     window = conn.execute("SELECT MIN(ts) AS a, MAX(ts) AS b FROM trades").fetchone()
+    tracker = BudgetTracker(conn, settings.provider_budgets(), enforce=settings.budget_enforce,
+                            costs=settings.credit_costs())
+    mtd = month_to_date(conn)
+    month = datetime.now(tz=timezone.utc).strftime("%Y-%m")
+
+    providers = sorted(set(mtd) | set(settings.provider_budgets()))
+    usage_rows = []
+    for provider in providers:
+        budget = tracker.budget_for(provider)
+        month_usage = mtd.get(provider)
+        today = tracker.day_usage(provider)
+        monthly_cap = budget.monthly_credit_budget
+        month_credits = month_usage.credits if month_usage else 0
+        usage_rows.append(
+            {
+                "provider": provider,
+                "mtd_requests": month_usage.requests if month_usage else 0,
+                "mtd_credits": month_credits,
+                "mtd_cache_hits": month_usage.cache_hits if month_usage else 0,
+                "today_requests": today.requests,
+                "today_credits": today.credits,
+                "monthly_budget": monthly_cap or 0,
+                "monthly_pct": (month_credits / monthly_cap) if monthly_cap else None,
+            }
+        )
+
     payload = {
         "db_path": str(settings.db_path),
         "counts": counts,
         "trade_window": {"from": ts_str(window["a"]), "to": ts_str(window["b"])},
         "helius_key": bool(settings.helius_api_key),
         "birdeye_key": bool(settings.birdeye_api_key),
+        "price_sources": list(settings.active_price_sources()),
+        "budget_enforce": settings.budget_enforce,
+        "month": month,
+        "usage": usage_rows,
         "version": __version__,
     }
     if args.json:
         print_json(payload)
         return 0
+
     print(f"whale-tracker {__version__}   db={settings.db_path}")
     print(f"trade window: {payload['trade_window']['from']} .. {payload['trade_window']['to']}")
     print(f"keys: helius={'set' if settings.helius_api_key else 'MISSING'} "
           f"birdeye={'set' if settings.birdeye_api_key else 'MISSING'}")
+    print(f"price sources: {', '.join(settings.active_price_sources()) or '(none)'}")
+    print(f"budget caps: {'enforced' if settings.budget_enforce else 'DISABLED'}")
     print_table(
         [{"table": k, "rows": v} for k, v in counts.items()],
         [("TABLE", "table", str), ("ROWS", "rows", str)],
+    )
+
+    print(f"\nAPI usage — month to date ({month}, UTC)")
+    print_table(
+        usage_rows,
+        [
+            ("PROVIDER", "provider", str),
+            ("REQUESTS", "mtd_requests", lambda v: f"{v:,}"),
+            ("CREDITS", "mtd_credits", lambda v: f"{v:,}"),
+            ("CACHE HITS", "mtd_cache_hits", lambda v: f"{v:,}"),
+            ("TODAY REQ", "today_requests", lambda v: f"{v:,}"),
+            ("TODAY CR", "today_credits", lambda v: f"{v:,}"),
+            ("MONTHLY CAP", "monthly_budget", lambda v: f"{v:,}" if v else "-"),
+            ("USED", "monthly_pct", lambda v: f"{v * 100:.1f}%" if v is not None else "-"),
+        ],
     )
     return 0
 
@@ -243,9 +367,29 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
     mints = read_token_list(args)
     if not mints:
         raise SystemExit("no tokens given: use --token <mint> (repeatable) or --tokens-file")
+    settings = apply_source_overrides(settings, args)
     conn = init_db(settings.db_path)
-    helius, birdeye = make_clients(settings, conn, args.provider)
-    oracle = PriceOracle(conn, birdeye, static_sol_price=args.sol_price)
+
+    if args.dry_run:
+        estimate = estimate_ingest(
+            settings,
+            mints,
+            max_txs=args.max_txs,
+            provider=args.provider,
+            since_ts=args.since,
+            now_ts=int(time.time()),
+        )
+        tracker = make_budget(settings, conn, args)
+        checks = budget_check(estimate, tracker, settings, conn)
+        if args.json:
+            print_json({**estimate.as_dict(), "budget_check": checks})
+        else:
+            for line in render(estimate, checks):
+                print(line)
+        return 0 if all(check["fits"] for check in checks) else 1
+
+    runtime = build_runtime(settings, conn, args, args.provider)
+    oracle = runtime.oracle(conn, args.sol_price)
 
     results = []
     failures = 0
@@ -255,14 +399,23 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
                 conn,
                 mint,
                 settings=settings,
-                helius=helius,
-                birdeye=birdeye,
+                helius=runtime.helius,
+                birdeye=runtime.birdeye,
                 oracle=oracle,
+                free_metadata=runtime.free_metadata,
                 max_txs=args.max_txs,
                 since_ts=args.since,
                 provider=args.provider,
             )
             results.append(result)
+        except BudgetExceeded as exc:
+            runtime.report()
+            print(f"\nbudget stop: {exc}", file=sys.stderr)
+            print(
+                f"ingested {len(results)} of {len(mints)} token(s) before stopping.",
+                file=sys.stderr,
+            )
+            return 4
         except ApiError as exc:
             failures += 1
             log.error("ingest.api_error", extra={"ctx": {"mint": mint, "error": str(exc)}})
@@ -287,6 +440,8 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
             ("UNPRICED", "unpriced", str),
         ],
     )
+    runtime.report()
+    print_usage(runtime.budget)
     if failures and not results:
         print(f"\nall {failures} token(s) failed — nothing ingested", file=sys.stderr)
         return 3
@@ -298,8 +453,42 @@ def cmd_ingest(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def print_usage(tracker: BudgetTracker) -> None:
+    """What this run actually consumed, per provider."""
+    summary = tracker.run_summary()
+    rows = [
+        {"provider": provider, **usage}
+        for provider, usage in summary.items()
+        if usage["requests"] or usage["cache_hits"]
+    ]
+    if not rows:
+        return
+    print("\nAPI usage this run")
+    print_table(
+        rows,
+        [
+            ("PROVIDER", "provider", str),
+            ("REQUESTS", "requests", lambda v: f"{v:,}"),
+            ("CREDITS", "credits", lambda v: f"{v:,}"),
+            ("CACHE HITS", "cache_hits", lambda v: f"{v:,}"),
+        ],
+    )
+
+
 def cmd_expand(args: argparse.Namespace, settings: Settings) -> int:
+    settings = apply_source_overrides(settings, args)
     conn = init_db(settings.db_path)
+    per_token = (
+        args.max_wallets_per_token
+        if args.max_wallets_per_token is not None
+        else settings.max_wallets_per_token
+    )
+    max_txs = (
+        args.max_txs_per_wallet
+        if args.max_txs_per_wallet is not None
+        else settings.max_txs_per_wallet
+    )
+
     if args.wallet:
         wallets = list(args.wallet)
     else:
@@ -309,34 +498,61 @@ def cmd_expand(args: argparse.Namespace, settings: Settings) -> int:
             min_trades=args.min_trades,
             min_volume_usd=args.min_volume,
             limit=args.limit,
+            per_token_limit=per_token,
         )
     if not wallets:
         print("no candidate wallets matched; ingest more tokens or lower --min-tokens")
         return 0
 
-    helius, birdeye = make_clients(settings, conn, "helius")
-    if helius is None:
+    if args.dry_run:
+        estimate = estimate_expand(
+            settings,
+            wallet_count=len(wallets),
+            max_txs_per_wallet=max_txs,
+            per_token_limit=per_token,
+            now_ts=int(time.time()),
+        )
+        tracker = make_budget(settings, conn, args)
+        checks = budget_check(estimate, tracker, settings, conn)
+        if args.json:
+            print_json({**estimate.as_dict(), "budget_check": checks})
+        else:
+            for line in render(estimate, checks):
+                print(line)
+        return 0 if all(check["fits"] for check in checks) else 1
+
+    runtime = build_runtime(settings, conn, args, "helius")
+    if runtime.helius is None:
         raise SystemExit("expand needs a Helius key (wallet history comes from Helius)")
-    oracle = PriceOracle(conn, birdeye, static_sol_price=args.sol_price)
+    oracle = runtime.oracle(conn, args.sol_price)
 
     total_new = 0
+    done = 0
     for index, wallet in enumerate(wallets, start=1):
         try:
             result = expand_wallet(
                 conn,
                 wallet,
                 settings=settings,
-                helius=helius,
+                helius=runtime.helius,
                 oracle=oracle,
-                max_txs=args.max_txs,
+                max_txs=max_txs,
                 since_ts=args.since,
             )
             total_new += result.trades_written
+            done += 1
             print(f"[{index}/{len(wallets)}] {wallet}  +{result.trades_written} trades "
                   f"({result.txs_seen} txs)")
+        except BudgetExceeded as exc:
+            runtime.report()
+            print(f"\nbudget stop: {exc}", file=sys.stderr)
+            print(f"expanded {done} of {len(wallets)} wallet(s) before stopping.", file=sys.stderr)
+            return 4
         except ApiError as exc:
             print(f"! {wallet}: {exc}", file=sys.stderr)
-    print(f"\n{total_new} new trades across {len(wallets)} wallets")
+    print(f"\n{total_new} new trades across {done} wallets")
+    runtime.report()
+    print_usage(runtime.budget)
     if args.analyse:
         return cmd_analyse(args, settings)
     print("next: whale-tracker analyse")
@@ -733,6 +949,88 @@ def cmd_backtests(args: argparse.Namespace, settings: Settings) -> int:
     return 0
 
 
+def cmd_price_check(args: argparse.Namespace, settings: Settings) -> int:
+    """Probe each configured price source in isolation.
+
+    Worth running once before a real ingest: it proves the keyless chain can
+    actually reach its upstreams from your network, and shows which source
+    answers for history (only some can).
+    """
+    settings = apply_source_overrides(settings, args)
+    # A connectivity probe should fail fast: the point is to find out whether a
+    # source answers, not to sit through a full retry ladder for each one.
+    settings = replace(settings, http_max_retries=max(1, args.retries),
+                       http_timeout_seconds=min(settings.http_timeout_seconds, args.timeout))
+    conn = init_db(settings.db_path)
+    budget = make_budget(settings, conn, args)
+    mint = args.mint or WSOL_MINT
+    ts = args.ts or (int(time.time()) - 7 * 86_400)
+
+    rows = []
+    for name in settings.active_price_sources():
+        chain = build_price_chain(settings, conn, budget, sources=[name])
+        source = chain.sources[0] if chain.sources else None
+        if source is None:
+            continue
+        row = {"source": name, "history": "yes" if source.supports_history else "no"}
+
+        started = time.time()
+        try:
+            row["spot"] = source.spot(mint)
+            row["spot_error"] = ""
+        except Exception as exc:
+            row["spot"] = None
+            row["spot_error"] = f"{type(exc).__name__}: {exc}"[:90]
+        row["spot_ms"] = int((time.time() - started) * 1000)
+
+        if source.supports_history:
+            started = time.time()
+            try:
+                points = source.history(mint, ts)
+                row["points"] = len(points)
+                row["history_error"] = ""
+            except Exception as exc:
+                row["points"] = 0
+                row["history_error"] = f"{type(exc).__name__}: {exc}"[:90]
+            row["history_ms"] = int((time.time() - started) * 1000)
+        else:
+            row["points"] = "-"
+            row["history_ms"] = "-"
+            row["history_error"] = ""
+        rows.append(row)
+
+    if args.json:
+        print_json({"mint": mint, "ts": ts, "sources": rows})
+        return 0
+
+    print(f"price sources for {mint}   (history probe at {ts_str(ts)})")
+    print_table(
+        rows,
+        [
+            ("SOURCE", "source", str),
+            ("HISTORY?", "history", str),
+            ("SPOT USD", "spot", lambda v: num(v, 9) if v else "-"),
+            ("SPOT ms", "spot_ms", str),
+            ("POINTS", "points", str),
+            ("HIST ms", "history_ms", str),
+            ("ERROR", "spot_error", lambda v: str(v)[:44]),
+            ("HIST ERROR", "history_error", lambda v: str(v)[:44]),
+        ],
+    )
+    working = [r for r in rows if r["spot"] or (isinstance(r["points"], int) and r["points"])]
+    if not working:
+        print("\nNo source answered. Check network egress, then try --price-sources one at a time.")
+        return 1
+    history_ok = [r for r in rows if isinstance(r["points"], int) and r["points"]]
+    if not history_ok:
+        print(
+            "\nNo source returned historical points: old trades will fall back to the nearest "
+            "cached price, or to --sol-price. Enable Birdeye (--enable-birdeye) for full history."
+        )
+    print_usage(budget)
+    return 0
+
+
 def cmd_demo_seed(args: argparse.Namespace, settings: Settings) -> int:
     from .demo import seed_demo
 
@@ -769,6 +1067,22 @@ def cmd_export(args: argparse.Namespace, settings: Settings) -> int:
 # ---------------------------------------------------------------------------
 
 
+def add_budget_flags(parser: argparse.ArgumentParser) -> None:
+    """Per-run budget overrides, available on every network-touching command."""
+    parser.add_argument("--max-requests", type=int,
+                        help="override the per-run request cap for every provider")
+    parser.add_argument("--max-credits", type=int,
+                        help="override the per-run Helius credit cap")
+
+
+def add_price_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--price-sources",
+                        help="comma-separated keyless sources in priority order "
+                             "(default: jupiter,dexscreener,geckoterminal)")
+    parser.add_argument("--enable-birdeye", action="store_true",
+                        help="also use Birdeye for prices (needs BIRDEYE_API_KEY)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="whale-tracker",
@@ -796,6 +1110,11 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--sol-price", type=float,
                         help="fallback SOL/USD when no price history is available")
     ingest.add_argument("--analyse", action="store_true", help="run analyse when done")
+    ingest.add_argument("--dry-run", action="store_true",
+                        help="project API calls and Helius credits without calling anything")
+    ingest.add_argument("--json", action="store_true", help="machine-readable dry-run output")
+    add_budget_flags(ingest)
+    add_price_flags(ingest)
     ingest.set_defaults(func=cmd_ingest)
 
     expand = sub.add_parser(
@@ -807,10 +1126,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="candidate must appear in this many ingested tokens")
     expand.add_argument("--min-trades", type=int, default=2)
     expand.add_argument("--min-volume", type=float, default=0.0)
-    expand.add_argument("--max-txs", type=int, default=1_000, help="tx cap per wallet")
+    expand.add_argument("--max-txs-per-wallet", type=int,
+                        help="tx cap per wallet (default: MAX_TXS_PER_WALLET, 200)")
+    expand.add_argument("--max-wallets-per-token", type=int,
+                        help="candidate wallets taken from each seed token "
+                             "(default: MAX_WALLETS_PER_TOKEN, 50)")
     expand.add_argument("--since", type=parse_time)
     expand.add_argument("--sol-price", type=float)
     expand.add_argument("--analyse", action="store_true")
+    expand.add_argument("--dry-run", action="store_true",
+                        help="project API calls and Helius credits without calling anything")
+    expand.add_argument("--json", action="store_true", help="machine-readable dry-run output")
+    add_budget_flags(expand)
+    add_price_flags(expand)
     expand.set_defaults(func=cmd_expand)
 
     analyse = sub.add_parser("analyse", help="rebuild P&L, detect patterns and score wallets")
@@ -889,6 +1217,21 @@ def build_parser() -> argparse.ArgumentParser:
     runs.add_argument("--json", action="store_true")
     runs.set_defaults(func=cmd_backtests)
 
+    price_check = sub.add_parser(
+        "price-check", help="probe each price source and report which ones answer"
+    )
+    price_check.add_argument("--mint", help="mint to price (default: wrapped SOL)")
+    price_check.add_argument("--ts", type=parse_time,
+                             help="timestamp for the history probe (default: 7 days ago)")
+    price_check.add_argument("--retries", type=int, default=1,
+                             help="attempts per source before giving up (default 1)")
+    price_check.add_argument("--timeout", type=float, default=10.0,
+                             help="per-request timeout in seconds (default 10)")
+    price_check.add_argument("--json", action="store_true")
+    add_budget_flags(price_check)
+    add_price_flags(price_check)
+    price_check.set_defaults(func=cmd_price_check)
+
     demo = sub.add_parser("demo-seed", help="fill the database with a synthetic universe")
     demo.add_argument("--tokens", type=int, default=10)
     demo.add_argument("--seed", type=int, default=7)
@@ -927,6 +1270,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    except BudgetExceeded as exc:
+        print(f"budget stop: {exc}", file=sys.stderr)
+        return 4
     except ApiError as exc:
         print(f"api error: {exc}", file=sys.stderr)
         return 3

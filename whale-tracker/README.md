@@ -58,8 +58,11 @@ Then edit `.env` and fill in:
 
 | Variable | Where to get it | Needed for |
 |---|---|---|
-| `HELIUS_API_KEY` | <https://dashboard.helius.dev> | ingestion, wallet history (the core) |
-| `BIRDEYE_API_KEY` | <https://bds.birdeye.so> | historical USD pricing, token metadata, optional trade tape |
+| `HELIUS_API_KEY` | <https://dashboard.helius.dev> | **required** — trade history and wallet history |
+| `BIRDEYE_API_KEY` | <https://bds.birdeye.so> | optional — only used when `ENABLE_BIRDEYE=true` |
+
+Prices no longer need a key. The default chain is **Jupiter → DexScreener →
+GeckoTerminal**, all keyless; see [Price sources](#price-sources).
 
 `.env` is in `.gitignore`. Keys are read from the environment only — nothing is
 hardcoded, and `tests/test_config.py` fails the build if a key is ever pasted
@@ -76,6 +79,13 @@ whale-tracker demo-seed          # synthetic universe: 10 tokens, ~200k trades
 whale-tracker analyse            # P&L -> patterns -> scores
 whale-tracker rank --reasons     # the ranked table, with flags explained
 whale-tracker backtest --from-rank 5 --max-penalty 0.3
+```
+
+Two commands worth running before you spend anything real:
+
+```bash
+whale-tracker price-check                     # can this machine reach the free price APIs?
+whale-tracker ingest --tokens-file tokens.txt --dry-run   # what would this cost?
 ```
 
 The synthetic universe deliberately contains a steady performer, a one-hit
@@ -95,23 +105,27 @@ cat > tokens.txt <<'EOF'
 EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm
 EOF
 
-# 2. Pull everyone who traded them.
+# 2. Price it before you buy it. No API calls are made.
+whale-tracker ingest --tokens-file tokens.txt --dry-run
+
+# 3. Pull everyone who traded them.
 whale-tracker ingest --tokens-file tokens.txt
 
-# 3. Pull the wider history of the candidates that showed up.
+# 4. Pull the wider history of the candidates that showed up.
 #    Repeatability cannot be judged from your seed tokens alone.
+whale-tracker expand --dry-run --min-tokens 2        # check the cost first
 whale-tracker expand --limit 100 --min-tokens 2
 
-# 4. Rebuild P&L, run the detectors, score everyone.
+# 5. Rebuild P&L, run the detectors, score everyone.
 whale-tracker analyse
 
-# 5. Look at the table.
+# 6. Look at the table.
 whale-tracker rank --limit 25 --min-tokens 4 --no-outliers --reasons
 
-# 6. Inspect anything that interests you.
+# 7. Inspect anything that interests you.
 whale-tracker wallet <address> --trades
 
-# 7. The go/no-go number.
+# 8. The go/no-go number.
 whale-tracker backtest \
     --from-rank 10 --max-penalty 0.3 --no-outliers \
     --start 2025-06-01 --end 2025-09-01 \
@@ -119,21 +133,188 @@ whale-tracker backtest \
     --size 250 --capital 5000
 ```
 
-### On API budget
+## API budget
 
 Ingesting a token walks its entire swap history, so a busy mint is thousands of
-requests. Guardrails:
+requests. Nothing here is best-effort: caps are **hard**, checked before each
+call leaves the process, and hitting one aborts the run naming the provider and
+the limit. There is no mode that quietly continues with degraded data.
 
-* `MAX_TXS_PER_TOKEN` (`.env`) and `--max-txs` cap the walk;
-* `--since 30d` (or `--since 2025-06-01`) limits how far back it goes;
+### See the cost before paying it
+
+`--dry-run` works on `ingest` and `expand`. It makes **no** API calls:
+
+```bash
+whale-tracker ingest --token <mint> --token <mint> --dry-run
+```
+
+```
+dry run — no API calls were made
+
+WHAT IT WOULD DO
+  tokens                         2
+  transactions per token (cap)   5,000
+  pages per token                50 × 100 per page
+  provider                       helius
+  price sources                  jupiter, dexscreener, geckoterminal
+
+PROJECTED CONSUMPTION (upper bound)
+  WHAT                      PROVIDER       CALLS  CREDITS EACH  CREDITS
+  ------------------------  -------------  -----  ------------  -------
+  parsed transaction pages  helius         100    100           10,000
+  token metadata            dexscreener    2      0             0
+  token metadata fallback   helius         2      10            20
+  SOL price history         geckoterminal  23     0             0
+
+  totals
+    helius              102 requests       10,020 credits
+
+BUDGET CHECK
+  helius         credits/run    ok       10,020 of 100,000 after this run (10.0%)
+  helius         credits/day    ok       10,020 of 250,000 after this run (4.0%)
+  helius         credits/month  ok       10,020 of 1,000,000 after this run (1.0%)
+```
+
+How to read it:
+
+* **Upper bound, always.** The projection assumes every token and every wallet
+  runs into its cap. A token with a shorter history stops early, so the real
+  figure is at most this. Bounding the other way round would defeat the point.
+* **`credits/month`** is measured against `HELIUS_MONTHLY_CREDIT_BUDGET` and
+  counts what you have already spent this month, from the database — so it is
+  the number to check against the 1M free tier.
+* **Exit code 1** means the run would breach a cap (`0` means it fits), so
+  `whale-tracker ingest ... --dry-run || echo "too big"` works in a script.
+  `--json` gives the same thing as structured data.
+
+### What a call costs
+
+Helius bills per method, so the estimate does too:
+
+| Call | Credits | Set by |
+|---|---|---|
+| Ordinary RPC | 1 | `HELIUS_CREDITS_RPC` |
+| `getProgramAccounts` | 10 | `HELIUS_CREDITS_HEAVY_RPC` |
+| DAS methods (`getAsset`, `searchAssets`, …) | 10 | `HELIUS_CREDITS_DAS` |
+| Enhanced Transactions API | 100 | `HELIUS_CREDITS_ENHANCED_TX` |
+
+The Enhanced Transactions API is what ingestion actually uses, so it dominates
+every estimate — **check the current rate for your plan and set
+`HELIUS_CREDITS_ENHANCED_TX` accordingly** before trusting a projection. The
+keyless price sources cost no credits; they are capped by request count only.
+
+Token metadata is deliberately routed to the cheapest source that can answer:
+DexScreener (free) first, Helius DAS (10 credits) only as a fallback.
+
+### Caps
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `BUDGET_ENFORCE` | `true` | Set `false` to meter without capping |
+| `HELIUS_MAX_REQUESTS_PER_RUN` / `_DAY` | 5,000 / 50,000 | Request caps |
+| `HELIUS_MAX_CREDITS_PER_RUN` / `_DAY` | 100,000 / 250,000 | Credit caps |
+| `HELIUS_MONTHLY_CREDIT_BUDGET` | 1,000,000 | Reporting only — the free tier |
+| `BIRDEYE_MAX_REQUESTS_PER_RUN` / `_DAY` | 2,000 / 20,000 | Request caps |
+| `PRICE_MAX_REQUESTS_PER_RUN` / `_DAY` | 1,000 / 10,000 | Applied to **each** keyless source |
+
+`0` means unlimited. Daily counters are UTC and live in the `api_usage` table,
+so restarting the process does not hand out a fresh daily allowance. Per-run
+overrides are available without editing `.env`:
+
+```bash
+whale-tracker ingest --tokens-file tokens.txt --max-credits 20000 --max-requests 500
+```
+
+When a cap is hit mid-run the command stops, prints which limit and how much
+was used, exits **4**, and *keeps the pages it already pulled* — the next run
+resumes from a larger base rather than starting over.
+
+### Fan-out caps
+
+`expand` multiplies: candidate wallets × pages per wallet. Both halves are
+capped, low, by default.
+
+| Setting | Default | Flag |
+|---|---|---|
+| `MAX_WALLETS_PER_TOKEN` | 50 | `--max-wallets-per-token` |
+| `MAX_TXS_PER_WALLET` | 200 | `--max-txs-per-wallet` |
+
+The wallet cap is applied **per seed token**, ranked by each wallet's USD
+volume in that token, then merged. Without it a single busy mint with 40,000
+traders would decide the whole expansion budget.
+
+### Watching consumption
+
+Running totals are logged per provider during a run, printed as a summary when
+it finishes, and persisted. `whale-tracker status` shows month-to-date:
+
+```
+API usage — month to date (2026-09, UTC)
+PROVIDER       REQUESTS  CREDITS  CACHE HITS  TODAY REQ  TODAY CR  MONTHLY CAP  USED
+-------------  --------  -------  ----------  ---------  --------  -----------  ----
+helius              120   12,000           4        120    12,000    1,000,000  1.2%
+geckoterminal        23        0          61         23         0            -  -
+```
+
+Other ways to spend less:
+
+* `--since 30d` (or `--since 2025-06-01`) limits how far back a walk goes;
+* `--max-txs` caps a single ingest;
 * every successful response is cached in SQLite for `HTTP_CACHE_TTL_SECONDS`
-  (default 24 h), so re-runs and interrupted runs are cheap;
-* `HELIUS_RATE_LIMIT_RPS` / `BIRDEYE_RATE_LIMIT_RPS` pace requests to your plan
-  — the free Birdeye tier is roughly 1 rps, which is the default here.
-
-Start with two or three tokens and `--max-txs 2000` to calibrate.
+  (default 24 h), so re-runs and resumed runs are cheap — cache hits are
+  counted, but cost nothing.
 
 ---
+
+## Price sources
+
+Prices come from a keyless fallback chain. Each request is logged with the
+source that served it.
+
+| Order | Source | History? | Free-tier limit | Notes |
+|---|---|---|---|---|
+| 1 | Jupiter | no | generous | Fast spot price |
+| 2 | DexScreener | no | ~300/min | Spot from the deepest pool; also free token metadata |
+| 3 | GeckoTerminal | **yes** | ~30/min | Hourly OHLCV — the only keyless historical source |
+| 4 | Birdeye | yes | plan-dependent | Only when `ENABLE_BIRDEYE=true` |
+
+Rules that make this safe to run on free tiers:
+
+* **Spot-only sources are skipped for old timestamps.** Asking Jupiter for last
+  month's price would silently return *today's*, which would corrupt the P&L.
+  Only history-capable sources answer for anything older than a couple of hours.
+* **Everything is cached in `price_points`, bucketed by hour.** One GeckoTerminal
+  OHLCV call fills ~100 hourly buckets, so a whole ingest usually needs a
+  handful of price calls in total.
+* **A 429 puts that source in cooldown** (`PRICE_SOURCE_COOLDOWN_SECONDS`,
+  default 300s) and the chain moves to the next one instead of retrying into
+  the limit. Other failures — an unknown mint, say — do not disable a source.
+* Only quote currencies are ever priced: SOL, and stablecoins at par.
+
+Override per run:
+
+```bash
+whale-tracker ingest --tokens-file tokens.txt --price-sources dexscreener,geckoterminal
+whale-tracker ingest --tokens-file tokens.txt --enable-birdeye
+```
+
+Check the chain works from your network before a real run:
+
+```bash
+whale-tracker price-check
+```
+
+```
+price sources for So111...112   (history probe at 2026-09-08 00:00)
+SOURCE         HISTORY?  SPOT USD     SPOT ms  POINTS  HIST ms  ERROR  HIST ERROR
+-------------  --------  -----------  -------  ------  -------  -----  ----------
+jupiter        no        142.310000       181  -       -
+dexscreener    no        142.280000       143  -       -
+geckoterminal  yes       142.300000       402  100     618
+```
+
+If no source returns historical points, old trades fall back to the nearest
+cached price or to `--sol-price`; the command says so.
 
 ## How the score works
 
@@ -269,9 +450,12 @@ whale-tracker backtests
 | Command | What it does |
 |---|---|
 | `init-db` | Create the SQLite schema |
-| `status` | Database contents, trade window, whether keys are set |
+| `status` | Database contents, trade window, keys, and month-to-date API usage |
 | `ingest --token M \| --tokens-file F` | Pull every wallet that traded those mints |
+| `ingest ... --dry-run` | Project calls and credits without making any |
 | `expand [--limit N]` | Pull candidates' wider history across all their tokens |
+| `expand --dry-run` | Same projection for the expansion fan-out |
+| `price-check` | Probe each price source and report which ones answer |
 | `analyse` | Rebuild P&L, run detectors, score wallets |
 | `rank [--reasons] [--json\|--csv F]` | The ranked candidate table |
 | `wallet ADDR [--trades]` | One wallet: scorecard, flags, positions, full trade history |
@@ -286,6 +470,21 @@ Useful global flags: `--db PATH`, `--env-file PATH`, `--log-level DEBUG`,
 
 Useful `rank` filters: `--min-tokens`, `--min-closed`, `--max-penalty`,
 `--min-pnl`, `--no-outliers`.
+
+Budget and price flags, available on `ingest`, `expand` and `price-check`:
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Project cost, call nothing (`ingest`, `expand` only) |
+| `--max-requests N` | Per-run request cap for every provider, this run only |
+| `--max-credits N` | Per-run Helius credit cap, this run only |
+| `--price-sources a,b` | Override the keyless chain and its order |
+| `--enable-birdeye` | Append Birdeye to the chain (needs a key) |
+| `--max-wallets-per-token N` | Fan-out cap per seed token (`expand`) |
+| `--max-txs-per-wallet N` | Transactions per wallet (`expand`) |
+
+Exit codes: `0` success, `1` a dry run that would breach a cap, `2` config
+error, `3` API failure, `4` budget cap hit mid-run.
 
 ---
 
@@ -303,6 +502,8 @@ One SQLite file (`WHALE_DB_PATH`, default `data/whale_tracker.db`):
 | `v_ranked_wallets` | The ranked candidate table (scores joined to flags) |
 | `backtest_runs` / `backtest_trades` | Every run's parameters, metrics and simulated fills |
 | `price_points` | Hour-bucketed USD prices (mostly SOL) for valuing quote legs |
+| `api_usage` | Requests, credits and cache hits per provider per UTC day |
+| `token_pools` | Liquidity pool discovered per mint, so lookups are not repeated |
 | `http_cache` | Cached provider responses, keyed by a hash |
 | `ingest_runs` | Ingestion bookkeeping, including failures |
 
@@ -313,6 +514,10 @@ SELECT wallet, score, win_rate, median_roi, realised_pnl_usd
 FROM v_ranked_wallets
 WHERE tokens_traded >= 5 AND penalty = 0 AND single_outlier = 0
 ORDER BY score DESC LIMIT 20;
+
+-- What has this month cost so far?
+SELECT provider, SUM(requests), SUM(credits), SUM(cache_hits)
+FROM api_usage WHERE day LIKE '2026-09-%' GROUP BY provider;
 ```
 
 ---
@@ -324,12 +529,22 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-97 tests, no network access required. They cover the P&L arithmetic
+160 tests, no network access required. They cover the P&L arithmetic
 (average-cost basis, partial exits, airdrops, dust), the scoring transforms and
 their edge cases, all three detectors, the backtest fill model, provider
 response parsing (including aggregator routes and balance-change fallbacks),
 HTTP retry/cache behaviour, and an end-to-end run over the synthetic universe
 that asserts a sniper never outranks a steady performer.
+
+The budget and price layers are covered specifically:
+
+* credit costs per method, per-run and per-day caps, daily totals surviving a
+  restart, and a real `ingest` that stops at its cap — proving the refused call
+  never reached the network and the pages already pulled were kept;
+* price fallback order, per-source 429 cooldown and its expiry, spot-only
+  sources being skipped for old timestamps, cache hits served from
+  `price_points`, and a parametrised check that a 429 from *each* real source
+  is handled the same way.
 
 ---
 
@@ -342,10 +557,13 @@ whale_tracker/
 ├── logging_setup.py    # structured JSON / console logging
 ├── db.py               # SQLite schema, upserts, cache, ranked view
 ├── models.py           # Trade, SwapLeg, PositionPnL, WalletScore, WalletFlags
+├── budget.py           # request/credit metering, hard caps, daily persistence
+├── estimate.py         # --dry-run projections and budget checks
 ├── clients/
-│   ├── base.py         # token-bucket rate limiting, retries, response cache
+│   ├── base.py         # rate limiting, retries, response cache, budget metering
 │   ├── helius.py       # parsed transaction history + swap-leg extraction
-│   └── birdeye.py      # trade tape, token metadata, historical prices
+│   ├── prices.py       # Jupiter / DexScreener / GeckoTerminal fallback chain
+│   └── birdeye.py      # trade tape, token metadata, historical prices (optional)
 ├── ingest.py           # discovery, USD pricing of the quote leg, persistence
 ├── pnl.py              # weighted-average-cost realised P&L
 ├── scoring.py          # repeatability scorecard
@@ -375,5 +593,13 @@ Worth knowing before you trust the output:
   that already exist in the tokens you chose. The detectors reduce the obvious
   traps; they do not make the sample unbiased.
 * **The backtest is an upper bound** — see the "not modelled" list above.
+* **Credit costs are a configured assumption, not a live lookup.** The tool
+  cannot read your Helius plan, so `--dry-run` is only as accurate as
+  `HELIUS_CREDITS_*`. Verify the Enhanced Transactions rate against your
+  dashboard once; it dominates every projection.
+* **Free price endpoints change without notice.** The parsers tolerate the
+  response shapes each API is documented to return, and fall through to the
+  next source when one does not answer. `whale-tracker price-check` is the
+  quickest way to confirm the chain still works from your network.
 
 Nothing here is financial advice, and nothing here places a trade.

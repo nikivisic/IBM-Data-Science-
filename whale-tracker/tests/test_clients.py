@@ -9,6 +9,8 @@ import pytest
 from whale_tracker.clients.base import ApiError, HttpClient, RateLimiter
 from whale_tracker.clients.birdeye import normalise_trade, overview_to_token_row
 from whale_tracker.clients.helius import candidate_wallets, extract_legs
+
+from conftest import FakeResponse, FakeSession
 from whale_tracker.config import WSOL_MINT
 
 WALLET = "5xKq8ZTdJ8YQ1Fh3Hs9M7Vp2Nn4Rr6Tt8Uu1Ww3Yy5Zz"
@@ -223,34 +225,6 @@ def test_rate_limiter_paces_calls():
     for _ in range(11):
         limiter.acquire()
     assert time.monotonic() - started >= 0.15
-
-
-class FakeResponse:
-    def __init__(self, status_code, payload=None, text="", headers=None):
-        self.status_code = status_code
-        self._payload = payload
-        self.text = text
-        self.headers = headers or {}
-
-    @property
-    def ok(self):
-        return 200 <= self.status_code < 300
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("not json")
-        return self._payload
-
-
-class FakeSession:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls = []
-        self.headers = {}
-
-    def request(self, method, url, params=None, json=None, headers=None, timeout=None):
-        self.calls.append({"method": method, "url": url, "params": params, "json": json})
-        return self.responses.pop(0)
 
 
 def make_client(session, conn=None, **kwargs):

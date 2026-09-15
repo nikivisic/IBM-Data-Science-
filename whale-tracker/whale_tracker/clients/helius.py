@@ -13,6 +13,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Iterator, Optional, Sequence
 
+from ..budget import BudgetTracker
 from ..config import QUOTE_MINTS, Settings, WSOL_MINT
 from ..logging_setup import get_logger
 from ..models import SwapLeg
@@ -26,7 +27,12 @@ LAMPORTS_PER_SOL = 1_000_000_000
 class HeliusClient:
     """Thin wrapper over the Helius enhanced-transactions and RPC endpoints."""
 
-    def __init__(self, settings: Settings, conn: Optional[sqlite3.Connection] = None):
+    def __init__(
+        self,
+        settings: Settings,
+        conn: Optional[sqlite3.Connection] = None,
+        budget: Optional[BudgetTracker] = None,
+    ):
         self.settings = settings
         self.api_key = settings.require_helius_key()
         self.http = HttpClient(
@@ -37,6 +43,10 @@ class HeliusClient:
             max_retries=settings.http_max_retries,
             conn=conn,
             cache_ttl_seconds=settings.http_cache_ttl_seconds,
+            budget=budget,
+            # Most traffic from this client is the Enhanced Transactions API;
+            # RPC calls override this per call with their own method name.
+            cost_kind="enhanced_tx",
         )
 
     # -- raw endpoints ----------------------------------------------------
@@ -57,7 +67,9 @@ class HeliusClient:
             params["until"] = until
         if tx_type:
             params["type"] = tx_type
-        payload = self.http.get(f"/v0/addresses/{address}/transactions", params=params)
+        payload = self.http.get(
+            f"/v0/addresses/{address}/transactions", params=params, cost_kind="enhanced_tx"
+        )
         if isinstance(payload, dict) and payload.get("error"):
             raise ApiError(f"helius error for {address}: {payload['error']}")
         return payload if isinstance(payload, list) else []
@@ -112,6 +124,7 @@ class HeliusClient:
                 "/v0/transactions",
                 params={"api-key": self.api_key},
                 json_body={"transactions": chunk},
+                cost_kind="enhanced_tx",
             )
             if isinstance(payload, list):
                 out.extend(payload)
@@ -122,6 +135,10 @@ class HeliusClient:
             f"{self.settings.helius_rpc_url}/",
             params={"api-key": self.api_key},
             json_body={"jsonrpc": "2.0", "id": "whale-tracker", "method": method, "params": params},
+            # DAS methods and getProgramAccounts are billed above plain RPC;
+            # the cost table resolves that from the method name.
+            cost_kind="rpc",
+            cost_method=method,
         )
         if isinstance(payload, dict) and payload.get("error"):
             raise ApiError(f"helius rpc {method} failed: {payload['error']}")
